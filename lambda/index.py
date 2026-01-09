@@ -14,18 +14,67 @@ from botocore.exceptions import ClientError
 
 '''
 This function pulls the json config data from DynamoDB and returns a python dictionary.
+It also updates last_checked and last_accessed fields in DynamoDB.
 It is called by the run_set_mode function.
+@param key_hostname: The normalized hostname to look up in DynamoDB
+@param source_ip: The client's IP address making the request
+@return The config dictionary parsed from the DynamoDB data attribute
 '''
-def read_config(key_hostname):
+def read_config(key_hostname, source_ip):
     # Define the dynamoDB client
     dynamodb = boto3.client("dynamodb")
+    table_name = os.environ.get("ddns_config_table")
     # Retrieve data based on key_hostname
     response = dynamodb.get_item(
-        TableName=os.environ.get("ddns_config_table"),
+        TableName=table_name,
         Key={'hostname': {'S': key_hostname}}
     )
+    
+    # Update last_checked and last_accessed in DynamoDB
+    try:
+        dynamodb.update_item(
+            TableName=table_name,
+            Key={'hostname': {'S': key_hostname}},
+            UpdateExpression='SET last_checked = :now_time, last_accessed = :last_accessed',
+            ConditionExpression='attribute_exists(hostname)',
+            ExpressionAttributeValues={
+                ':now_time': {'S': str(datetime.datetime.now(datetime.timezone.utc))},
+                ':last_accessed': {'S': source_ip}
+            }
+        )
+    except Exception:
+        # If update fails, continue anyway - we still have the config data
+        pass
+    
     # Return the json as a dictionary.
     return json.loads(response["Item"]["data"]["S"])
+
+
+'''
+This function updates the DynamoDB table with last_updated, ip_address, and last_accessed.
+It is called after successfully updating a Route53 record.
+@param key_hostname: The normalized hostname to update in DynamoDB
+@param source_ip: The client's IP address making the request
+'''
+def update_dynamodb_record(key_hostname, source_ip):
+    # Define the dynamoDB client
+    dynamodb = boto3.client("dynamodb")
+    try:
+        dynamodb.update_item(
+            TableName=os.environ.get("ddns_config_table"),
+            Key={'hostname': {'S': key_hostname}},
+            UpdateExpression='SET last_updated = :now_time, ip_address = :ip, last_accessed = :last_accessed',
+            ConditionExpression='attribute_exists(hostname)',
+            ExpressionAttributeValues={
+                ':now_time': {'S': str(datetime.datetime.now(datetime.timezone.utc))},
+                ':ip': {'S': source_ip},
+                ':last_accessed': {'S': source_ip}
+            }
+        )
+    except Exception as e:
+        # Log error but don't fail the request
+        print(f'Error updating DynamoDB record for {key_hostname}: {str(e)}')
+
 
 '''
 This function takes the python dictionary returned from read_config
@@ -117,7 +166,7 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp):
     normalized_hostname = normalize_hostname(ddns_hostname)
     # Try to read the config, and error if you can't.
     try:
-        full_config=read_config(normalized_hostname)
+        full_config=read_config(normalized_hostname, source_ip)
     except:
         return_status='fail'
         return_message='There was an issue finding '\
@@ -185,6 +234,9 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp):
             route_53_record_ttl,
             route_53_record_type,
             source_ip)
+        # If Route53 update was successful, update DynamoDB with tracking information
+        if return_status['return_status'] == 'success':
+            update_dynamodb_record(normalized_hostname, source_ip)
         return return_status
 
 
