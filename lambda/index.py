@@ -296,70 +296,142 @@ def validate_timestamp(timestamp):
 
 
 '''
+Helper function to extract parameters from event based on input mode.
+Supports both 'body' (Function URL) and 'queryStringParameters' (API Gateway) modes.
+@param event: The Lambda event object
+@return Dictionary with extracted parameters or None if extraction fails
+'''
+def extract_event_parameters(event):
+    # Get input mode from environment variable (default: 'body')
+    input_mode = os.environ.get('input_mode', 'body').lower()
+
+    try:
+        if input_mode == 'queryStringParameters':
+            # API Gateway mode - read from queryStringParameters
+            params = event.get('queryStringParameters') or {}
+            return {
+                'execution_mode': params.get('mode') or params.get('execution_mode'),
+                'validation_hash': params.get('validation_hash') or params.get('hash'),
+                'ddns_hostname': params.get('ddns_hostname') or params.get('hostname') or params.get('set_hostname'),
+                'timestamp': params.get('timestamp')
+            }
+        else:
+            # Default: Function URL mode - read from body
+            body = json.loads(event.get('body', '{}'))
+            return {
+                'execution_mode': body.get('mode') or body.get('execution_mode'),
+                'validation_hash': body.get('validation_hash') or body.get('hash'),
+                'ddns_hostname': body.get('ddns_hostname') or body.get('hostname') or body.get('set_hostname'),
+                'timestamp': body.get('timestamp')
+            }
+    except (json.JSONDecodeError, AttributeError, TypeError) as e:
+        return None
+
+
+'''
+Helper function to extract source IP from event based on event structure.
+Supports both Function URL and API Gateway event formats.
+@param event: The Lambda event object
+@return The source IP address or None if not found
+'''
+def extract_source_ip(event):
+    # Try Function URL format first
+    try:
+        if 'requestContext' in event and 'http' in event['requestContext']:
+            return event['requestContext']['http'].get('sourceIp')
+    except (KeyError, AttributeError, TypeError):
+        pass
+    
+    # Try API Gateway format
+    try:
+        if 'requestContext' in event and 'identity' in event['requestContext']:
+            return event['requestContext']['identity'].get('sourceIp')
+    except (KeyError, AttributeError, TypeError):
+        pass
+    
+    # Try alternative API Gateway format
+    try:
+        if 'requestContext' in event:
+            return event['requestContext'].get('sourceIp')
+    except (KeyError, AttributeError, TypeError):
+        pass
+    
+    return None
+
+
+'''
 The function that Lambda executes. It contains the main script logic.
 '''
 def lambda_handler(event, context):
-    # Get execution mode and source IP
-    execution_mode = json.loads(event['body'])['execution_mode']
-    source_ip = event['requestContext']['http']['sourceIp']
-
-    # Verify that the execution mode was set correctly.
-    execution_modes = ('set', 'get')
-    if execution_mode not in execution_modes:
+    # Extract parameters based on input mode
+    params = extract_event_parameters(event)
+    if params is None:
         return_dict = {
             'status_code': 400,
             'return_status': 'fail',
-            'return_message': 'You must pass execution_mode=get or execution_mode=set arguments.'
+            'return_message': 'Invalid request format. Unable to parse parameters.'
         }
-    # For get mode, reflect the client's public IP address and exit.
-    elif execution_mode == 'get':
-        return_dict = {
-            'status_code': 200,
-            'return_status': 'success',
-            'return_message': source_ip
-        }
-    # Proceed with set mode to create or update the DNS record.
     else:
-        # Set event data to variables.
-        try:
-            validation_hash = json.loads(event['body'])['validation_hash']
-            ddns_hostname = json.loads(event['body'])['ddns_hostname']
-            timestamp = json.loads(event['body'])['timestamp']
-        except (KeyError, json.JSONDecodeError) as e:
+        # Extract source IP from event
+        source_ip = extract_source_ip(event)
+        if not source_ip:
             return_dict = {
                 'status_code': 400,
                 'return_status': 'fail',
-                'return_message': 'Invalid request body: ' + str(e)
+                'return_message': 'Unable to determine source IP address.'
             }
         else:
-            if not ddns_hostname:
+            execution_mode = params.get('execution_mode')
+            
+            # Verify that the execution mode was set correctly.
+            execution_modes = ('set', 'get')
+            if not execution_mode or execution_mode not in execution_modes:
                 return_dict = {
                     'status_code': 400,
                     'return_status': 'fail',
-                    'return_message': 'You must pass a hostname, set_hostname, or ddns_hostname argument.'
+                    'return_message': 'You must pass execution_mode=get or execution_mode=set arguments.'
                 }
-            elif not validation_hash:
+            # For get mode, reflect the client's public IP address and exit.
+            elif execution_mode == 'get':
                 return_dict = {
-                    'status_code': 400,
-                    'return_status': 'fail',
-                    'return_message': 'You must pass a hash or validation_hash argument.'
+                    'status_code': 200,
+                    'return_status': 'success',
+                    'return_message': source_ip
                 }
-            elif not timestamp:
-                return_dict = {
-                    'status_code': 400,
-                    'return_status': 'fail',
-                    'return_message': 'You must pass a timestamp argument.'
-                }
+            # Proceed with set mode to create or update the DNS record.
             else:
-                if not validate_timestamp(timestamp):
+                validation_hash = params.get('validation_hash')
+                ddns_hostname = params.get('ddns_hostname')
+                timestamp = params.get('timestamp')
+                
+                if not ddns_hostname:
                     return_dict = {
                         'status_code': 400,
                         'return_status': 'fail',
-                        'return_message': 'You must pass a timestamp in ISO 8601 format in the '\
-                            'timestamp= argument. It must be within 5 minutes of the server.'
+                        'return_message': 'You must pass a hostname, set_hostname, or ddns_hostname argument.'
+                    }
+                elif not validation_hash:
+                    return_dict = {
+                        'status_code': 400,
+                        'return_status': 'fail',
+                        'return_message': 'You must pass a hash or validation_hash argument.'
+                    }
+                elif not timestamp:
+                    return_dict = {
+                        'status_code': 400,
+                        'return_status': 'fail',
+                        'return_message': 'You must pass a timestamp argument.'
                     }
                 else:
-                    return_dict = run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp)
+                    if not validate_timestamp(timestamp):
+                        return_dict = {
+                            'status_code': 400,
+                            'return_status': 'fail',
+                            'return_message': 'You must pass a timestamp in ISO 8601 format in the '\
+                                'timestamp= argument. It must be within 5 minutes of the server.'
+                        }
+                    else:
+                        return_dict = run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp)
 
     # This Lambda function always exits as a success
     # and passes success or failure information in the json message.

@@ -70,6 +70,9 @@ class DyndnsStack(cdk.Stack):
         ) 
 
 
+        # Get input mode from context (default: body)
+        input_mode = self.node.try_get_context("lambda_input_mode") or "body"
+        
         fn = lambda_.Function(self, "dyndns_fn",
             runtime=lambda_.Runtime.PYTHON_3_14,
             architecture=lambda_.Architecture.ARM_64,
@@ -77,9 +80,10 @@ class DyndnsStack(cdk.Stack):
             code=lambda_.Code.from_asset("lambda"),
             role=fn_role,
             timeout=cdk.Duration.seconds(8),
-            #Provide DynammoDB table name as enviroment variable
+            #Provide DynamoDB table name and input mode as environment variables
             environment={
-                "ddns_config_table":table.table_name
+                "ddns_config_table": table.table_name,
+                "input_mode": input_mode
             }
         )            
 
