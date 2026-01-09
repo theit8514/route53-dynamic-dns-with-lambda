@@ -8,6 +8,8 @@ import re
 import hashlib
 import boto3
 import os
+import datetime
+import dateutil.parser
 from botocore.exceptions import ClientError
 
 '''
@@ -111,10 +113,11 @@ This function calls route53_client to see if the current Route 53 DNS record mat
 If not it calls route53_client to set the DNS record to the current IP.
 It is called by the main lambda_handler function.
 '''
-def run_set_mode(ddns_hostname, validation_hash, source_ip):
+def run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp):
+    normalized_hostname = normalize_hostname(ddns_hostname)
     # Try to read the config, and error if you can't.
     try:
-        full_config=read_config(ddns_hostname)
+        full_config=read_config(normalized_hostname)
     except:
         return_status='fail'
         return_message='There was an issue finding '\
@@ -137,63 +140,107 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip):
     # Validate that the client passed a sha256 hash
     # regex checks for a 64 character hex string.
     if not re.match(r'[0-9a-fA-F]{64}', validation_hash):
-        return_status='fail'
-        return_message='You must pass a valid sha256 hash in the '\
-            'hash= argument.'
         return {'status_code': 400,
+                'return_status': 'fail',
+                'return_message': 'You must pass a valid sha256 hash in the '\
+                    'hash= argument.'}
+    if not validate_hash(normalized_hostname, source_ip, validation_hash, shared_secret, timestamp):
+        return {'status_code': 401,
+                'return_status': 'fail',
+                'return_message': 'Validation hashes do not match.'}
+
+    # If they do match, get the current ip address associated with
+    # the hostname DNS record from Route 53.
+    route53_get_response=route53_client(
+        'get_record',
+        route_53_zone_id,
+        normalized_hostname,
+        route_53_record_ttl,
+        route_53_record_type,
+        '')
+    # If no records were found, route53_client returns null.
+    # Set route53_ip and stop evaluating the null response.
+    if route53_get_response['return_status'] == "fail":
+        return {'status_code': 500,
+                'return_status': route53_get_response['return_status'],
+                'return_message': route53_get_response['return_message']}
+    else:
+        route53_ip = route53_get_response['return_message']
+    # If the client's current IP matches the current DNS record
+    # in Route 53 there is nothing left to do.
+    if route53_ip == source_ip:
+        return_status = 'success'
+        return_message = 'Your IP address matches '\
+            'the current Route53 DNS record.'
+        return {'status_code': 200,
                 'return_status': return_status,
                 'return_message': return_message}
-    # Calculate the validation hash.
-    hashcheck=source_ip + ddns_hostname + shared_secret
-    calculated_hash=hashlib.sha256(
-        hashcheck.encode('utf-8')).hexdigest()
+    # If the IP addresses do not match or if the record does not exist,
+    # Tell Route 53 to set the DNS record.
+    else:
+        return_status = route53_client(
+            'set_record',
+            route_53_zone_id,
+            normalized_hostname,
+            route_53_record_ttl,
+            route_53_record_type,
+            source_ip)
+        return return_status
+
+
+'''
+This function normalizes the hostname to lowercase and adds a trailing dot if not present.
+It is called by the run_set_mode function.
+@param ddns_hostname: The DNS hostname to be updated.
+@return The normalized hostname.
+'''
+def normalize_hostname(ddns_hostname):
+    if not ddns_hostname.endswith('.'):
+        ddns_hostname += '.'
+    return ddns_hostname.lower()
+
+
+'''
+Validates that a client-supplied hash matches the expected hash
+generated from the IP address, hostname, shared secret, and timestamp.
+The timestamp is required for security and helps prevent replay attacks.
+
+@param normalized_hostname: The normalized hostname to be updated.
+@param source_ip: The client's IP address making the request.
+@param validation_hash: The hash value provided by the client for validation.
+@param shared_secret: Shared secret used to compute the hash.
+@param timestamp: ISO8601-formatted timestamp provided by the client.
+@return True if the hash matches, False otherwise
+'''
+def validate_hash(normalized_hostname, source_ip, validation_hash, shared_secret, timestamp):
+    # Calculate the validation hash with timestamp: source_ip|hostname|secret|timestamp
+    input = source_ip + '|' + normalized_hostname + '|' + shared_secret + '|' + timestamp
+    calculated_hash = hashlib.sha256(input.encode('utf-8')).hexdigest()
     # Compare the validation_hash from the client to the
     # calculated_hash.
     # If they don't match, error out.
-    if not calculated_hash == validation_hash:
-        return_status='fail'
-        return_message='Validation hashes do not match.'
-        return {'status_code': 401,
-                'return_status': return_status,
-                'return_message': return_message}
-    # If they do match, get the current ip address associated with
-    # the hostname DNS record from Route 53.
-    else:
-        route53_get_response=route53_client(
-            'get_record',
-            route_53_zone_id,
-            ddns_hostname,
-            route_53_record_ttl,
-            route_53_record_type,
-            '')
-        # If no records were found, route53_client returns null.
-        # Set route53_ip and stop evaluating the null response.
-        if route53_get_response['return_status'] == "fail":
-            return {'status_code': 500,
-                    'return_status': route53_get_response['return_status'],
-                    'return_message': route53_get_response['return_message']}
+    return calculated_hash == validation_hash
+
+
+'''
+This function validates the timestamp is the correct format and is within the last 5 minutes.
+It is called by the main lambda_handler function.
+@param timestamp the timestamp of the request
+@return True if the timestamp is valid, False otherwise
+'''
+def validate_timestamp(timestamp):
+    # Validate timestamp format
+    if not re.match(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', timestamp):
+        return False
+    try:
+        parsed_timestamp = dateutil.parser.parse(timestamp)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if abs((now - parsed_timestamp).total_seconds()) > 300:
+            return False
         else:
-            route53_ip = route53_get_response['return_message']
-        # If the client's current IP matches the current DNS record
-        # in Route 53 there is nothing left to do.
-        if route53_ip == source_ip:
-            return_status = 'success'
-            return_message = 'Your IP address matches '\
-                'the current Route53 DNS record.'
-            return {'status_code': 200,
-                    'return_status': return_status,
-                    'return_message': return_message}
-        # If the IP addresses do not match or if the record does not exist,
-        # Tell Route 53 to set the DNS record.
-        else:
-            return_status = route53_client(
-                'set_record',
-                route_53_zone_id,
-                ddns_hostname,
-                route_53_record_ttl,
-                route_53_record_type,
-                source_ip)
-            return return_status
+            return True
+    except Exception as e:
+        return False
 
 
 '''
@@ -222,9 +269,45 @@ def lambda_handler(event, context):
     # Proceed with set mode to create or update the DNS record.
     else:
         # Set event data to variables.
-        validation_hash = json.loads(event['body'])['validation_hash']
-        ddns_hostname = json.loads(event['body'])['ddns_hostname']
-        return_dict = run_set_mode(ddns_hostname, validation_hash, source_ip)
+        try:
+            validation_hash = json.loads(event['body'])['validation_hash']
+            ddns_hostname = json.loads(event['body'])['ddns_hostname']
+            timestamp = json.loads(event['body'])['timestamp']
+        except (KeyError, json.JSONDecodeError) as e:
+            return_dict = {
+                'status_code': 400,
+                'return_status': 'fail',
+                'return_message': 'Invalid request body: ' + str(e)
+            }
+        else:
+            if not ddns_hostname:
+                return_dict = {
+                    'status_code': 400,
+                    'return_status': 'fail',
+                    'return_message': 'You must pass a hostname, set_hostname, or ddns_hostname argument.'
+                }
+            elif not validation_hash:
+                return_dict = {
+                    'status_code': 400,
+                    'return_status': 'fail',
+                    'return_message': 'You must pass a hash or validation_hash argument.'
+                }
+            elif not timestamp:
+                return_dict = {
+                    'status_code': 400,
+                    'return_status': 'fail',
+                    'return_message': 'You must pass a timestamp argument.'
+                }
+            else:
+                if not validate_timestamp(timestamp):
+                    return_dict = {
+                        'status_code': 400,
+                        'return_status': 'fail',
+                        'return_message': 'You must pass a timestamp in ISO 8601 format in the '\
+                            'timestamp= argument. It must be within 5 minutes of the server.'
+                    }
+                else:
+                    return_dict = run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp)
 
     # This Lambda function always exits as a success
     # and passes success or failure information in the json message.
