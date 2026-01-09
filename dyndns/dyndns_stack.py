@@ -11,12 +11,29 @@ class DyndnsStack(cdk.Stack):
         super().__init__(scope, construct_id, **kwargs)
      
         
-        #Create dynamoDB table
-        table = dynamodb.Table(self, "dyndns_db",
-            partition_key=dynamodb.Attribute(name="hostname", type=dynamodb.AttributeType.STRING),
-            removal_policy=cdk.RemovalPolicy.DESTROY,
-            point_in_time_recovery=True                   
-        )
+        # Create DynamoDB table with configurable capacity
+        # Get billing mode from context (default: on-demand)
+        billing_mode_str = self.node.try_get_context("dynamodb_billing_mode") or "on-demand"
+        billing_mode = dynamodb.BillingMode.PAY_PER_REQUEST if billing_mode_str.lower() == "on-demand" else dynamodb.BillingMode.PROVISIONED
+        
+        # Build table props
+        table_props = {
+            "partition_key": dynamodb.Attribute(name="hostname", type=dynamodb.AttributeType.STRING),
+            "removal_policy": cdk.RemovalPolicy.DESTROY,
+            "point_in_time_recovery": True,
+            "billing_mode": billing_mode
+        }
+        
+        # If using provisioned capacity, set read and write capacity units
+        if billing_mode == dynamodb.BillingMode.PROVISIONED:
+            read_capacity = self.node.try_get_context("dynamodb_read_capacity")
+            write_capacity = self.node.try_get_context("dynamodb_write_capacity")
+            
+            # Default to 5 units if not specified
+            table_props["read_capacity"] = read_capacity if read_capacity is not None else 5
+            table_props["write_capacity"] = write_capacity if write_capacity is not None else 5
+        
+        table = dynamodb.Table(self, "dyndns_db", **table_props)
         
         #Create Lambda role
         fn_role = iam.Role(self, "dyndns_fn_role",

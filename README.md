@@ -48,6 +48,26 @@ Deploy the stack
 
 > `cdk deploy`
 
+### DynamoDB Capacity Configuration
+
+The DynamoDB table billing mode and capacity can be configured using CDK context variables. By default, the table uses on-demand billing mode.
+
+To configure the DynamoDB table, you can pass context variables during deployment:
+
+**On-demand billing mode (default):**
+> `cdk deploy`
+
+**Provisioned billing mode with custom capacity:**
+> `cdk deploy -c dynamodb_billing_mode=provisioned -c dynamodb_read_capacity=10 -c dynamodb_write_capacity=10`
+
+**Provisioned billing mode with default capacity (5 read/write units):**
+> `cdk deploy -c dynamodb_billing_mode=provisioned`
+
+Available context variables:
+- `dynamodb_billing_mode`: Set to `"on-demand"` (default) or `"provisioned"`
+- `dynamodb_read_capacity`: Read capacity units for provisioned mode (default: 5)
+- `dynamodb_write_capacity`: Write capacity units for provisioned mode (default: 5)
+
 ## Configuration
 
 ### Route53 Hosted zone and record set
