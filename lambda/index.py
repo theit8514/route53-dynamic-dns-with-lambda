@@ -26,14 +26,15 @@ def read_config(key_hostname):
     return json.loads(response["Item"]["data"]["S"])
 
 '''
-    This function takes the python dictionary returned from read_configThis function defines the interaction with Route 53.
-    It is called by the run_set_mode function.
-    @param execution_mode defines whether to set or get a DNS record
-    @param route_53_zone_id defines the id for the DNS zone
-    @param route_53_record_name defines the record, ie www.acme.com.
-    @param route_53_record_ttl defines defines the DNS record TTL
-    @param route_53_record_type defines record type, should always be 'a'
-    @param public_ip defines the current public ip of the client
+This function takes the python dictionary returned from read_config
+This function defines the interaction with Route 53.
+It is called by the run_set_mode function.
+@param execution_mode defines whether to set or get a DNS record
+@param route_53_zone_id defines the id for the DNS zone
+@param route_53_record_name defines the record, ie www.acme.com.
+@param route_53_record_ttl defines defines the DNS record TTL
+@param route_53_record_type defines record type, should always be 'a'
+@param public_ip defines the current public ip of the client
 '''
 def route53_client(execution_mode, route_53_zone_id,
                    route_53_record_name, route_53_record_ttl,
@@ -57,11 +58,17 @@ def route53_client(execution_mode, route_53_zone_id,
                     currentroute53_ip = '0'
             except:
                 currentroute53_ip = '0'
-            return {'return_status': 'success', 'return_message': currentroute53_ip}
+            return {'status_code': 200,
+                    'return_status': 'success',
+                    'return_message': currentroute53_ip}
         except ClientError as e:
-            return {'return_status': 'fail', 'return_message': str(e)}
+            return {'status_code': 500,
+                    'return_status': 'fail',
+                    'return_message': str(e)}
         except:
-            return {'return_status': 'fail', 'return_message': 'Unknown error'}
+            return {'status_code': 500,
+                    'return_status': 'fail',
+                    'return_message': 'Unknown error'}
 
     # Set the DNS record to the current IP.
     if execution_mode == 'set_record':
@@ -86,11 +93,17 @@ def route53_client(execution_mode, route_53_zone_id,
                     ]
                 }
             )
-            return [201, {'return_status': 'success', 'return_message': route_53_record_name+' has been updated to '+public_ip}]
+            return {'status_code': 201,
+                    'return_status': 'success',
+                    'return_message': route_53_record_name+' has been updated to '+public_ip}
         except ClientError as e:
-            return [500, {'return_status': 'fail', 'return_message': str(e)}]
+            return {'status_code': 500,
+                    'return_status': 'fail',
+                    'return_message': str(e)}
         except:
-            return [500, {'return_status': 'fail', 'return_message': 'Unknown error'}]
+            return {'status_code': 500,
+                    'return_status': 'fail',
+                    'return_message': 'Unknown error'}
 
 
 '''
@@ -107,8 +120,9 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip):
         return_message='There was an issue finding '\
             'or reading '+ddns_hostname+' configuration from dynamoDB table: ' + \
             os.environ.get("ddns_config_table")
-        return [403, {'return_status': return_status,
-                'return_message': return_message}]
+        return {'status_code': 403,
+                'return_status': return_status,
+                'return_message': return_message}
 
     # Get the section of the config related to the requested hostname.
     record_config_set=full_config  # [ddns_hostname]
@@ -126,8 +140,9 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip):
         return_status='fail'
         return_message='You must pass a valid sha256 hash in the '\
             'hash= argument.'
-        return [400, {'return_status': return_status,
-                'return_message': return_message}]
+        return {'status_code': 400,
+                'return_status': return_status,
+                'return_message': return_message}
     # Calculate the validation hash.
     hashcheck=source_ip + ddns_hostname + shared_secret
     calculated_hash=hashlib.sha256(
@@ -138,9 +153,9 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip):
     if not calculated_hash == validation_hash:
         return_status='fail'
         return_message='Validation hashes do not match.'
-        return [401, {
+        return {'status_code': 401,
                 'return_status': return_status,
-                'return_message': return_message}]
+                'return_message': return_message}
     # If they do match, get the current ip address associated with
     # the hostname DNS record from Route 53.
     else:
@@ -154,7 +169,9 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip):
         # If no records were found, route53_client returns null.
         # Set route53_ip and stop evaluating the null response.
         if route53_get_response['return_status'] == "fail":
-            return [500, route53_get_response]
+            return {'status_code': 500,
+                    'return_status': route53_get_response['return_status'],
+                    'return_message': route53_get_response['return_message']}
         else:
             route53_ip = route53_get_response['return_message']
         # If the client's current IP matches the current DNS record
@@ -163,8 +180,9 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip):
             return_status = 'success'
             return_message = 'Your IP address matches '\
                 'the current Route53 DNS record.'
-            return [200, {'return_status': return_status,
-                    'return_message': return_message}]
+            return {'status_code': 200,
+                    'return_status': return_status,
+                    'return_message': return_message}
         # If the IP addresses do not match or if the record does not exist,
         # Tell Route 53 to set the DNS record.
         else:
@@ -181,8 +199,6 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip):
 '''
 The function that Lambda executes. It contains the main script logic.
 '''
-
-
 def lambda_handler(event, context):
     # Get execution mode and source IP
     execution_mode = json.loads(event['body'])['execution_mode']
@@ -191,18 +207,18 @@ def lambda_handler(event, context):
     # Verify that the execution mode was set correctly.
     execution_modes = ('set', 'get')
     if execution_mode not in execution_modes:
-        return_status = 'fail'
-        return_message = 'You must pass mode=get or mode=set arguments.'
-        return_dict = [400, {'return_status': return_status,
-                             'return_message': return_message}]
-
+        return_dict = {
+            'status_code': 400,
+            'return_status': 'fail',
+            'return_message': 'You must pass execution_mode=get or execution_mode=set arguments.'
+        }
     # For get mode, reflect the client's public IP address and exit.
-    if execution_mode == 'get':
-        return_status = 'success'
-        return_message = source_ip
-        return_dict = [200, {'return_status': return_status,
-                             'return_message': return_message}]
-
+    elif execution_mode == 'get':
+        return_dict = {
+            'status_code': 200,
+            'return_status': 'success',
+            'return_message': source_ip
+        }
     # Proceed with set mode to create or update the DNS record.
     else:
         # Set event data to variables.
@@ -215,11 +231,12 @@ def lambda_handler(event, context):
     # return json.loads(return_dict)
 
     return {
-        "statusCode": return_dict[0],
+        "statusCode": return_dict['status_code'],
         'headers': {
             'Access-Control-Allow-Headers': 'Content-Type',
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET'
         },
-        "body": json.dumps(return_dict[1])
+        "body": json.dumps({'return_status': return_dict['return_status'],
+                             'return_message': return_dict['return_message']})
     }
