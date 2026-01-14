@@ -118,8 +118,14 @@ if confirm == 'y':
                 'hostname': {
                     'S': hostname
                 },
-                'data': {
-                    'S': '{"route_53_zone_id": "'+hzid+'","route_53_record_ttl": '+str(ttl)+',"shared_secret": "'+secret+'"}'
+                'route_53_zone_id': {
+                    'S': hzid
+                },
+                'route_53_record_ttl': {
+                    'N': str(ttl)  # DynamoDB numbers are stored as string representation
+                },
+                'shared_secret': {
+                    'S': secret
                 }
             }
         )

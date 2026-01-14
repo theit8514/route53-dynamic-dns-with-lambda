@@ -29,7 +29,48 @@ def read_config(key_hostname, source_ip):
         TableName=table_name,
         Key={'hostname': {'S': key_hostname}}
     )
+
+    # Check if the item exists
+    if 'Item' not in response:
+        print(f'## READ_CONFIG - ERROR: Configuration not found for hostname: {key_hostname}')
+        raise KeyError(f'Configuration not found for hostname: {key_hostname}')
+
+    item = response["Item"]
     
+    # Support both formats: individual fields (new) or data field with JSON (legacy)
+    if 'data' in item:
+        # Legacy format: parse JSON from data field
+        data_string = item["data"]["S"]
+        parsed_config = json.loads(data_string)
+    else:
+        # New format: read from individual fields
+        required_fields = ['shared_secret', 'route_53_zone_id', 'route_53_record_ttl']
+        missing_fields = [field for field in required_fields if field not in item]
+        
+        if missing_fields:
+            print(f'## READ_CONFIG - ERROR: Missing required fields: {missing_fields}')
+            print(f'  Available attributes: {list(item.keys())}')
+            raise KeyError(f'Missing required configuration fields for hostname {key_hostname}: {missing_fields}')
+        
+        # Extract values from DynamoDB attribute format
+        # DynamoDB stores strings as {'S': 'value'}, numbers as {'N': 'value'}
+        def get_string_value(field_name):
+            if field_name not in item:
+                return None
+            attr = item[field_name]
+            if 'S' in attr:
+                return attr['S']
+            elif 'N' in attr:
+                return attr['N']  # Return as string, will convert to int if needed
+            else:
+                raise ValueError(f'Unexpected attribute type for {field_name}: {list(attr.keys())}')
+        
+        parsed_config = {
+            'shared_secret': get_string_value('shared_secret'),
+            'route_53_zone_id': get_string_value('route_53_zone_id'),
+            'route_53_record_ttl': int(get_string_value('route_53_record_ttl'))  # Convert TTL to int
+        }
+
     # Update last_checked and last_accessed in DynamoDB
     try:
         dynamodb.update_item(
@@ -42,12 +83,12 @@ def read_config(key_hostname, source_ip):
                 ':last_accessed': {'S': source_ip}
             }
         )
-    except Exception:
+    except Exception as e:
         # If update fails, continue anyway - we still have the config data
+        print(f'## READ_CONFIG - Warning: Failed to update last_checked/last_accessed: {e}')
         pass
     
-    # Return the json as a dictionary.
-    return json.loads(response["Item"]["data"]["S"])
+    return parsed_config
 
 
 '''
@@ -167,14 +208,18 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp):
     # Try to read the config, and error if you can't.
     try:
         full_config=read_config(normalized_hostname, source_ip)
-    except:
-        return_status='fail'
-        return_message='There was an issue finding '\
-            'or reading '+ddns_hostname+' configuration from dynamoDB table: ' + \
-            os.environ.get("ddns_config_table")
-        return {'status_code': 403,
-                'return_status': return_status,
-                'return_message': return_message}
+    except KeyError as e:
+        print(f"Configuration not found for {ddns_hostname} (lookup key: {normalized_hostname}): {e}")
+        return {'status_code': 404,
+                'return_status': 'fail',
+                'return_message': f'Configuration not found for hostname: {ddns_hostname}. Please ensure the hostname is registered in the DynamoDB table.'}
+    except Exception as e:
+        print(f"Error reading config for {ddns_hostname}: {e}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return {'status_code': 500,
+                'return_status': 'fail',
+                'return_message': f'There was an issue finding or reading {ddns_hostname} configuration from DynamoDB table: {str(e)}'}
 
     # Get the section of the config related to the requested hostname.
     record_config_set=full_config  # [ddns_hostname]
@@ -249,7 +294,7 @@ It is called by the run_set_mode function.
 def normalize_hostname(ddns_hostname):
     if not ddns_hostname.endswith('.'):
         ddns_hostname += '.'
-    return ddns_hostname.lower()
+    return ddns_hostname
 
 
 '''
@@ -282,16 +327,35 @@ It is called by the main lambda_handler function.
 '''
 def validate_timestamp(timestamp):
     # Validate timestamp format
-    if not re.match(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', timestamp):
+    if not timestamp:
+        print('## VALIDATE TIMESTAMP - Failed: timestamp is None or empty')
         return False
+    
+    if not re.match(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', timestamp):
+        print(f'## VALIDATE TIMESTAMP - Failed: format does not match regex pattern')
+        return False
+    
     try:
         parsed_timestamp = dateutil.parser.parse(timestamp)
+        # Ensure parsed timestamp is timezone-aware (default to UTC if naive)
+        if parsed_timestamp.tzinfo is None:
+            print('## VALIDATE TIMESTAMP - Warning: parsed timestamp is naive, assuming UTC')
+            parsed_timestamp = parsed_timestamp.replace(tzinfo=datetime.timezone.utc)
+        
         now = datetime.datetime.now(datetime.timezone.utc)
-        if abs((now - parsed_timestamp).total_seconds()) > 300:
+        time_diff_seconds = abs((now - parsed_timestamp).total_seconds())
+        print(f'## VALIDATE TIMESTAMP - Time difference: {time_diff_seconds} seconds')
+        
+        if time_diff_seconds > 300:
+            print(f'## VALIDATE TIMESTAMP - Failed: time difference ({time_diff_seconds}s) exceeds 5 minutes (300s)')
             return False
         else:
+            print('## VALIDATE TIMESTAMP - Success: timestamp is valid')
             return True
     except Exception as e:
+        print(f'## VALIDATE TIMESTAMP - Exception: {str(e)}')
+        import traceback
+        print(f'## VALIDATE TIMESTAMP - Traceback: {traceback.format_exc()}')
         return False
 
 
@@ -299,32 +363,53 @@ def validate_timestamp(timestamp):
 Helper function to extract parameters from event based on input mode.
 Supports both 'body' (Function URL) and 'queryStringParameters' (API Gateway) modes.
 @param event: The Lambda event object
+@param input_mode: The mode indicating where to extract parameters from the event ('body' for Function URL, 'queryStringParameters' for API Gateway)
 @return Dictionary with extracted parameters or None if extraction fails
 '''
-def extract_event_parameters(event):
-    # Get input mode from environment variable (default: 'body')
-    input_mode = os.environ.get('input_mode', 'body').lower()
-
+def extract_event_parameters(event, input_mode):
+    print('## ENVIRONMENT VARIABLES')
+    print(os.environ)
+    print('## EVENT')
+    print(event)
+    print('## INPUT MODE')
+    print(input_mode)
     try:
         if input_mode == 'queryStringParameters':
             # API Gateway mode - read from queryStringParameters
             params = event.get('queryStringParameters') or {}
-            return {
+            print('## QUERY STRING PARAMETERS (raw)')
+            print(params)
+            extracted = {
                 'execution_mode': params.get('mode') or params.get('execution_mode'),
                 'validation_hash': params.get('validation_hash') or params.get('hash'),
                 'ddns_hostname': params.get('ddns_hostname') or params.get('hostname') or params.get('set_hostname'),
                 'timestamp': params.get('timestamp')
             }
+            print('## EXTRACTED PARAMETERS')
+            print(f'execution_mode: {extracted["execution_mode"]}')
+            print(f'validation_hash: {extracted["validation_hash"]}')
+            print(f'ddns_hostname: {extracted["ddns_hostname"]}')
+            print(f'timestamp: {extracted["timestamp"]} (type: {type(extracted["timestamp"])})')
+            return extracted
         else:
             # Default: Function URL mode - read from body
             body = json.loads(event.get('body', '{}'))
-            return {
+            print('## BODY (parsed)')
+            print(body)
+            extracted = {
                 'execution_mode': body.get('mode') or body.get('execution_mode'),
                 'validation_hash': body.get('validation_hash') or body.get('hash'),
                 'ddns_hostname': body.get('ddns_hostname') or body.get('hostname') or body.get('set_hostname'),
                 'timestamp': body.get('timestamp')
             }
+            print('## EXTRACTED PARAMETERS')
+            print(f'execution_mode: {extracted["execution_mode"]}')
+            print(f'validation_hash: {extracted["validation_hash"]}')
+            print(f'ddns_hostname: {extracted["ddns_hostname"]}')
+            print(f'timestamp: {extracted["timestamp"]} (type: {type(extracted["timestamp"])})')
+            return extracted
     except (json.JSONDecodeError, AttributeError, TypeError) as e:
+        print(f'## ERROR EXTRACTING PARAMETERS: {str(e)}')
         return None
 
 
@@ -363,8 +448,10 @@ def extract_source_ip(event):
 The function that Lambda executes. It contains the main script logic.
 '''
 def lambda_handler(event, context):
+    # Determine allowed methods based on input mode
+    input_mode = os.environ.get('input_mode', 'body')
     # Extract parameters based on input mode
-    params = extract_event_parameters(event)
+    params = extract_event_parameters(event, input_mode)
     if params is None:
         return_dict = {
             'status_code': 400,
@@ -404,6 +491,11 @@ def lambda_handler(event, context):
                 ddns_hostname = params.get('ddns_hostname')
                 timestamp = params.get('timestamp')
                 
+                print('## SET MODE PARAMETERS')
+                print(f'validation_hash: {validation_hash}')
+                print(f'ddns_hostname: {ddns_hostname}')
+                print(f'timestamp: {timestamp} (type: {type(timestamp)})')
+                
                 if not ddns_hostname:
                     return_dict = {
                         'status_code': 400,
@@ -423,7 +515,11 @@ def lambda_handler(event, context):
                         'return_message': 'You must pass a timestamp argument.'
                     }
                 else:
-                    if not validate_timestamp(timestamp):
+                    print('## BEFORE TIMESTAMP VALIDATION')
+                    timestamp_validation_result = validate_timestamp(timestamp)
+                    print(f'## TIMESTAMP VALIDATION RESULT: {timestamp_validation_result}')
+                    if not timestamp_validation_result:
+                        print('## TIMESTAMP VALIDATION FAILED - Setting error message')
                         return_dict = {
                             'status_code': 400,
                             'return_status': 'fail',
@@ -431,18 +527,21 @@ def lambda_handler(event, context):
                                 'timestamp= argument. It must be within 5 minutes of the server.'
                         }
                     else:
+                        print('## TIMESTAMP VALIDATION PASSED - Calling run_set_mode')
                         return_dict = run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp)
+                        print(f'## RUN_SET_MODE RETURNED: {return_dict}')
 
     # This Lambda function always exits as a success
     # and passes success or failure information in the json message.
     # return json.loads(return_dict)
 
+    allowed_methods = 'POST' if input_mode == 'body' else 'GET'
     return {
         "statusCode": return_dict['status_code'],
         'headers': {
             'Access-Control-Allow-Headers': 'Content-Type',
             'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET'
+            'Access-Control-Allow-Methods': allowed_methods
         },
         "body": json.dumps({'return_status': return_dict['return_status'],
                              'return_message': return_dict['return_message']})
