@@ -42,6 +42,9 @@ def read_config(key_hostname, source_ip):
         # Legacy format: parse JSON from data field
         data_string = item["data"]["S"]
         parsed_config = json.loads(data_string)
+        # Ensure lock_record is set (default to False if not present)
+        if 'lock_record' not in parsed_config:
+            parsed_config['lock_record'] = False
     else:
         # New format: read from individual fields
         required_fields = ['shared_secret', 'route_53_zone_id', 'route_53_record_ttl']
@@ -70,6 +73,19 @@ def read_config(key_hostname, source_ip):
             'route_53_zone_id': get_string_value('route_53_zone_id'),
             'route_53_record_ttl': int(get_string_value('route_53_record_ttl'))  # Convert TTL to int
         }
+        
+        # Check for lock_record flag (optional field)
+        if 'lock_record' in item:
+            lock_attr = item['lock_record']
+            # DynamoDB can store boolean as BOOL type or as string 'true'/'false'
+            if 'BOOL' in lock_attr:
+                parsed_config['lock_record'] = lock_attr['BOOL']
+            elif 'S' in lock_attr:
+                parsed_config['lock_record'] = lock_attr['S'].lower() in ('true', '1', 'yes')
+            else:
+                parsed_config['lock_record'] = False
+        else:
+            parsed_config['lock_record'] = False
 
     # Update last_checked and last_accessed in DynamoDB
     try:
@@ -230,6 +246,13 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp):
     route_53_record_ttl=record_config_set['route_53_record_ttl']
     route_53_record_type="A"
     shared_secret=record_config_set['shared_secret']
+    lock_record=record_config_set.get('lock_record', False)
+
+    # Check if record is locked (after config loaded so last_accessed is audited)
+    if lock_record:
+        return {'status_code': 403,
+                'return_status': 'fail',
+                'return_message': 'This DNS record is locked and cannot be updated.'}
 
     # Validate that the client passed a sha256 hash
     # regex checks for a 64 character hex string.
