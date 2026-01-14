@@ -23,6 +23,7 @@ class DyndnsStack(cdk.Stack):
         # Build table props
         table_props = {
             "partition_key": dynamodb.Attribute(name="hostname", type=dynamodb.AttributeType.STRING),
+            "sort_key": dynamodb.Attribute(name="record_type", type=dynamodb.AttributeType.STRING),
             "removal_policy": cdk.RemovalPolicy.DESTROY,
             "point_in_time_recovery": True,
             "billing_mode": billing_mode

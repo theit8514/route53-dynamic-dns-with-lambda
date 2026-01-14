@@ -17,25 +17,31 @@ This function pulls the json config data from DynamoDB and returns a python dict
 It also updates last_checked and last_accessed fields in DynamoDB.
 It is called by the run_set_mode function.
 @param key_hostname: The normalized hostname to look up in DynamoDB
+@param key_record_type: The DNS record type (A or AAAA)
 @param source_ip: The client's IP address making the request
 @return The config dictionary parsed from the DynamoDB data attribute
 '''
-def read_config(key_hostname, source_ip):
+def read_config(key_hostname, key_record_type, source_ip):
     # Define the dynamoDB client
     dynamodb = boto3.client("dynamodb")
     table_name = os.environ.get("ddns_config_table")
-    # Retrieve data based on key_hostname
-    response = dynamodb.get_item(
+    # Retrieve data based on key_hostname and key_record_type using query (composite key)
+    response = dynamodb.query(
         TableName=table_name,
-        Key={'hostname': {'S': key_hostname}}
+        KeyConditionExpression='hostname = :hostname AND record_type = :record_type',
+        ExpressionAttributeValues={
+            ':hostname': {'S': key_hostname},
+            ':record_type': {'S': key_record_type}
+        },
+        Limit=1
     )
 
     # Check if the item exists
-    if 'Item' not in response:
-        print(f'## READ_CONFIG - ERROR: Configuration not found for hostname: {key_hostname}')
-        raise KeyError(f'Configuration not found for hostname: {key_hostname}')
+    if 'Items' not in response or len(response['Items']) == 0:
+        print(f'## READ_CONFIG - ERROR: Configuration not found for hostname: {key_hostname}, record_type: {key_record_type}')
+        raise KeyError(f'Configuration not found for hostname: {key_hostname}, record_type: {key_record_type}')
 
-    item = response["Item"]
+    item = response['Items'][0]
     
     # Support both formats: individual fields (new) or data field with JSON (legacy)
     if 'data' in item:
@@ -91,9 +97,12 @@ def read_config(key_hostname, source_ip):
     try:
         dynamodb.update_item(
             TableName=table_name,
-            Key={'hostname': {'S': key_hostname}},
+            Key={
+                'hostname': {'S': key_hostname},
+                'record_type': {'S': key_record_type}
+            },
             UpdateExpression='SET last_checked = :now_time, last_accessed = :last_accessed',
-            ConditionExpression='attribute_exists(hostname)',
+            ConditionExpression='attribute_exists(hostname) AND attribute_exists(record_type)',
             ExpressionAttributeValues={
                 ':now_time': {'S': str(datetime.datetime.now(datetime.timezone.utc))},
                 ':last_accessed': {'S': source_ip}
@@ -111,17 +120,21 @@ def read_config(key_hostname, source_ip):
 This function updates the DynamoDB table with last_updated, ip_address, and last_accessed.
 It is called after successfully updating a Route53 record.
 @param key_hostname: The normalized hostname to update in DynamoDB
+@param key_record_type: The DNS record type (A or AAAA)
 @param source_ip: The client's IP address making the request
 '''
-def update_dynamodb_record(key_hostname, source_ip):
+def update_dynamodb_record(key_hostname, key_record_type, source_ip):
     # Define the dynamoDB client
     dynamodb = boto3.client("dynamodb")
     try:
         dynamodb.update_item(
             TableName=os.environ.get("ddns_config_table"),
-            Key={'hostname': {'S': key_hostname}},
+            Key={
+                'hostname': {'S': key_hostname},
+                'record_type': {'S': key_record_type}
+            },
             UpdateExpression='SET last_updated = :now_time, ip_address = :ip, last_accessed = :last_accessed',
-            ConditionExpression='attribute_exists(hostname)',
+            ConditionExpression='attribute_exists(hostname) AND attribute_exists(record_type)',
             ExpressionAttributeValues={
                 ':now_time': {'S': str(datetime.datetime.now(datetime.timezone.utc))},
                 ':ip': {'S': source_ip},
@@ -130,7 +143,7 @@ def update_dynamodb_record(key_hostname, source_ip):
         )
     except Exception as e:
         # Log error but don't fail the request
-        print(f'Error updating DynamoDB record for {key_hostname}: {str(e)}')
+        print(f'Error updating DynamoDB record for {key_hostname}, record_type {key_record_type}: {str(e)}')
 
 
 '''
@@ -221,14 +234,22 @@ It is called by the main lambda_handler function.
 '''
 def run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp):
     normalized_hostname = normalize_hostname(ddns_hostname)
+    
+    # Determine record type: AAAA for IPv6, A for IPv4
+    # IPv4 regex: matches 1-3 digits, dot, 1-3 digits, dot, 1-3 digits, dot, 1-3 digits
+    if not re.match(r'[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}', source_ip):
+        record_type = 'AAAA'  # IPv6
+    else:
+        record_type = 'A'  # IPv4
+    
     # Try to read the config, and error if you can't.
     try:
-        full_config=read_config(normalized_hostname, source_ip)
+        full_config=read_config(normalized_hostname, record_type, source_ip)
     except KeyError as e:
-        print(f"Configuration not found for {ddns_hostname} (lookup key: {normalized_hostname}): {e}")
+        print(f"Configuration not found for {ddns_hostname} (lookup key: {normalized_hostname}, record_type: {record_type}): {e}")
         return {'status_code': 404,
                 'return_status': 'fail',
-                'return_message': f'Configuration not found for hostname: {ddns_hostname}. Please ensure the hostname is registered in the DynamoDB table.'}
+                'return_message': f'Configuration not found for hostname: {ddns_hostname}, record_type: {record_type}. Please ensure the hostname is registered in the DynamoDB table.'}
     except Exception as e:
         print(f"Error reading config for {ddns_hostname}: {e}")
         import traceback
@@ -244,7 +265,8 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp):
     # record TTL (Time To Live) in seconds tells DNS servers how long to cache
     # the record.
     route_53_record_ttl=record_config_set['route_53_record_ttl']
-    route_53_record_type="A"
+    # Use record_type from config if available, otherwise use the determined one
+    route_53_record_type=record_config_set.get('record_type', record_type)
     shared_secret=record_config_set['shared_secret']
     lock_record=record_config_set.get('lock_record', False)
 
@@ -304,7 +326,7 @@ def run_set_mode(ddns_hostname, validation_hash, source_ip, timestamp):
             source_ip)
         # If Route53 update was successful, update DynamoDB with tracking information
         if return_status['return_status'] == 'success':
-            update_dynamodb_record(normalized_hostname, source_ip)
+            update_dynamodb_record(normalized_hostname, route_53_record_type, source_ip)
         return return_status
 
 
