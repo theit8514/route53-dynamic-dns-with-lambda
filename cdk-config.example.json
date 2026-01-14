@@ -1,0 +1,16 @@
+{
+  "lambda_input_mode": "queryStringParameters",
+  "enable_api_key": true,
+  "custom_domain_name": "ddns.example.com",
+  "certificate_arn": "arn:aws:acm:us-east-1:ACCOUNTID:certificate/CERTIFICATEID",
+  "route53_zone_name": "example.com",
+  "route53_zone_id": "Z20IC83ZONEID",
+  "dynamodb_billing_mode": "on-demand",
+  "dynamodb_read_capacity": null,
+  "dynamodb_write_capacity": null,
+  "api_key_id": null,
+  "api_throttle_rate_limit": null,
+  "api_throttle_burst_limit": null,
+  "api_quota_limit": null,
+  "api_quota_period": null
+}

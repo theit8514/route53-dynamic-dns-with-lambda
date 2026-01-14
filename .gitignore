@@ -10,3 +10,8 @@ __pycache__
 cdk.out
 test.sh
 cdk.context.json
+
+# CDK configuration files (keep example file)
+cdk-config.json
+config.json
+.env
